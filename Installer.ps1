@@ -825,6 +825,82 @@ $InstallWorker = {
         return $p.ExitCode
     }
 
+    # --- Ярлыки на рабочем столе ---
+    $startDirs = @((Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'),
+                   (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))
+    $publicDesktop = Join-Path $env:PUBLIC 'Desktop'
+    $deskDirs = @($publicDesktop, [Environment]::GetFolderPath('Desktop'))
+    $junk = '(?i)uninstall|unins|удал|деинстал|readme|help|справк|website|web site|сайт|manual|руководств|license|лиценз|changelog|release notes'
+
+    function Get-Links([string[]]$dirs) {
+        $set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($d in $dirs) {
+            if (Test-Path -LiteralPath $d) {
+                Get-ChildItem -LiteralPath $d -Recurse -Include *.lnk, *.url -File -ErrorAction SilentlyContinue | ForEach-Object { [void]$set.Add($_.FullName) }
+            }
+        }
+        return ,$set
+    }
+    function Test-OnDesktop([string]$name) {
+        foreach ($d in $deskDirs) { if (Test-Path -LiteralPath (Join-Path $d $name)) { return $true } }
+        return $false
+    }
+    function New-Link([string]$target, [string]$name) {
+        $lnk = Join-Path $publicDesktop "$name.lnk"
+        $sh = New-Object -ComObject WScript.Shell
+        $sc = $sh.CreateShortcut($lnk)
+        $sc.TargetPath = $target
+        $sc.WorkingDirectory = Split-Path -Parent $target
+        $sc.Save()
+        return $lnk
+    }
+    # Главный exe программы, если установщик не создал ярлык в «Пуске»
+    function Find-AppExe([string]$appName) {
+        $word = ($appName -split '[\s\-\.]+' | Where-Object { $_.Length -ge 3 } | Select-Object -First 1)
+        if (-not $word) { return $null }
+        $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, (Join-Path $env:LOCALAPPDATA 'Programs')) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+        foreach ($r in $roots) {
+            foreach ($dir in @(Get-ChildItem -LiteralPath $r -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$word*" })) {
+                $exe = Get-ChildItem -LiteralPath $dir.FullName -Filter *.exe -File -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -like "*$word*" -and $_.Name -notmatch $junk } | Select-Object -First 1
+                if ($exe) { return $exe.FullName }
+            }
+        }
+        return $null
+    }
+    function Add-DesktopShortcut($j, $startBefore, $deskBefore) {
+        if (-not $j.Shortcut) { return }
+        try {
+            $deskNew = @((Get-Links $deskDirs) | Where-Object { -not $deskBefore.Contains($_) })
+            if ($deskNew.Count) { Log "    Ярлык на рабочем столе: $([IO.Path]::GetFileName($deskNew[0]))"; return }
+            $startNew = @((Get-Links $startDirs) | Where-Object { -not $startBefore.Contains($_) -and [IO.Path]::GetFileName($_) -notmatch $junk })
+            foreach ($l in $startNew) { Log "    В меню «Пуск»: $($l.Substring($l.IndexOf('Programs') + 9))" }
+            if ($startNew.Count) {
+                # Из новых ярлыков «Пуска» берём похожий на название программы, иначе первый
+                $word = ($j.Name -split '[\s\-\.]+' | Select-Object -First 1)
+                $pick = @($startNew | Where-Object { [IO.Path]::GetFileNameWithoutExtension($_) -like "*$word*" })
+                if (-not $pick.Count) { $pick = @($startNew[0]) }
+                foreach ($l in ($pick | Select-Object -First 2)) {
+                    $n = [IO.Path]::GetFileName($l)
+                    if (Test-OnDesktop $n) { continue }
+                    Copy-Item -LiteralPath $l -Destination (Join-Path $publicDesktop $n) -Force
+                    Log "    Создан ярлык на рабочем столе: $n"
+                }
+                return
+            }
+            $exe = $null
+            if ($j.Exe) { $exe = [Environment]::ExpandEnvironmentVariables($j.Exe); if (-not (Test-Path -LiteralPath $exe)) { Log "    Не найден exe из apps.json: $exe"; $exe = $null } }
+            if (-not $exe) { $exe = Find-AppExe $j.Name }
+            if ($exe) {
+                if (Test-OnDesktop "$($j.Name).lnk") { return }
+                $lnk = New-Link $exe $j.Name
+                Log "    Установщик не создал ярлык. Создан ярлык на рабочем столе: $([IO.Path]::GetFileName($lnk)) -> $exe"
+            } else {
+                Log '    Ярлык не найден и exe программы не обнаружен. Можно указать путь к exe в apps.json (поле "exe").'
+            }
+        } catch { Log "    Не удалось создать ярлык: $($_.Exception.Message)" }
+    }
+
     $ok = 0; $fail = 0; $skip = 0; $reboot = $false; $cancelled = $false
     $total = $jobs.Count
     Log ('Начало установки: {0} шт., режим: {1}' -f $total, $(if ($silent) { 'тихий' } else { 'обычный' }))
@@ -841,6 +917,8 @@ $InstallWorker = {
         Send @{ Type = 'progress'; Value = $n; Max = $total; Text = ('[{0}/{1}] {2}' -f ($n + 1), $total, $j.Name) }
         Send @{ Type = 'status'; Index = $j.Index; Status = 'Установка...' }
         Log "=== $($j.Name) ==="
+        $startBefore = Get-Links $startDirs
+        $deskBefore  = Get-Links $deskDirs
         $result = 'Ошибка'
 
         try {
@@ -915,6 +993,7 @@ $InstallWorker = {
         else                                       { $fail++ }
         Send @{ Type = 'status'; Index = $j.Index; Status = $result }
         Log "    Итог: $result"
+        if ($result.StartsWith('Установлено')) { Add-DesktopShortcut $j $startBefore $deskBefore }
     }
 
     Log ('Готово. Установлено: {0}, уже было: {1}, ошибок: {2}' -f $ok, $skip, $fail)
@@ -1360,6 +1439,7 @@ function Invoke-Message($m) {
             Set-Busy $false
             Clear-Workers
             $script:Winget = $m.Path
+            Add-PortableWingetToPath
             Update-WingetInfo
             $ui.Progress.Value = 0
             $ui.ProgressText.Text = $(if ($m.Path) { 'Готово к установке' } else { 'winget не установлен: доступны только программы из url и local' })
@@ -1455,6 +1535,7 @@ $ui.BtnInstall.Add_Click({
             Index = $it.Index; Name = $it.Name; Source = $it.Source; Id = $it.Id; WingetSource = $it.WingetSource
             Url = $it.Url; UrlPage = $it.UrlPage; UrlPattern = $it.UrlPattern; Path = $it.Path; FileName = $it.FileName
             SilentArgs = $it.SilentArgs; NormalArgs = $it.NormalArgs; ExtraArgs = $it.ExtraArgs
+            Shortcut = ($config.apps[$it.Index].shortcut -ne $false); Exe = [string]$config.apps[$it.Index].exe
         }
     }
     $jobs = @($jobs)
@@ -1494,6 +1575,21 @@ $Window.Add_Closing({
 # ---------------------------------------------------------------------------
 # Запуск
 # ---------------------------------------------------------------------------
+# Портативный winget (C:\ProgramData\BatchInstaller\winget) добавляем в системный PATH,
+# чтобы команда winget работала и в консоли. Системный PATH идёт раньше пользовательского,
+# поэтому он перекрывает неработающий псевдоним из %LOCALAPPDATA%\Microsoft\WindowsApps.
+function Add-PortableWingetToPath {
+    $dir = Join-Path $env:ProgramData 'BatchInstaller\winget'
+    if (-not $script:Winget -or -not $script:Winget.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)) { return }
+    try {
+        $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        if (($machine -split ';') -notcontains $dir) {
+            [Environment]::SetEnvironmentVariable('Path', ($machine.TrimEnd(';') + ';' + $dir), 'Machine')
+            Write-UiLog "Портативный winget добавлен в системный PATH ($dir). В новых окнах консоли команда winget будет работать."
+        }
+    } catch { Write-UiLog "Не удалось добавить winget в PATH: $($_.Exception.Message)" }
+}
+
 function Update-WingetInfo {
     if ($script:Winget) {
         $ver = try { (& $script:Winget --version 2>$null | Select-Object -First 1) } catch { '' }
@@ -1525,6 +1621,7 @@ function Start-WingetSetup {
 $ui.WingetInfo.Add_MouseLeftButtonUp({ if (-not $script:Winget) { Start-WingetSetup } })
 
 Update-WingetInfo
+Add-PortableWingetToPath
 if (-not $Winget) { $Window.Add_ContentRendered({ Start-WingetSetup }) }
 $ru = [Globalization.CultureInfo]::GetCultureInfo('ru-RU')
 $now = Get-Date
