@@ -107,11 +107,7 @@ function Find-Winget {
 }
 
 $Winget = Find-Winget
-if (-not $Winget) {
-    # На свежей системе App Installer часто есть, но не зарегистрирован для пользователя
-    try { Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop } catch { }
-    $Winget = Find-Winget
-}
+# Если winget нет, он ставится автоматически после открытия окна (см. $WingetSetupWorker)
 
 # ---------------------------------------------------------------------------
 # Загрузка списка программ
@@ -930,6 +926,198 @@ $CheckWorker = {
     }
 }
 
+# Установка winget, если его нет (сборки Windows с вырезанным App Installer)
+$WingetSetupWorker = {
+    param($sync, $logFile)
+    $ErrorActionPreference = 'Stop'
+    $ProgressPreference = 'SilentlyContinue'
+
+    function Send([hashtable]$m) { $sync.Queue.Enqueue($m) }
+    function Log([string]$t) {
+        $line = '[{0:HH:mm:ss}] {1}' -f (Get-Date), $t
+        Send @{ Type = 'log'; Text = $line }
+        try { Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 } catch { }
+    }
+    function Step([string]$t) { Send @{ Type = 'progress'; Value = 0; Max = 1; Text = $t }; Log $t }
+
+    function Find-Winget {
+        $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+        $user = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+        if (Test-Path -LiteralPath $user) { return $user }
+        $exe = Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
+               Sort-Object LastWriteTime | Select-Object -Last 1
+        if ($exe) { return $exe.FullName }
+        return $null
+    }
+
+    # winget найден и отвечает на --version
+    function Test-Winget {
+        $w = Find-Winget
+        if (-not $w) { return $null }
+        try {
+            $v = & $w --version 2>$null | Select-Object -First 1
+            if ($LASTEXITCODE -eq 0 -and $v) { return $w }
+        } catch { }
+        return $null
+    }
+
+    # Загрузка файла с отображением прогресса
+    function Get-File([string]$url, [string]$file, [string]$title) {
+        $req = [Net.HttpWebRequest]::Create($url)
+        $req.UserAgent = 'BatchInstaller'
+        $req.AllowAutoRedirect = $true
+        $resp = $req.GetResponse()
+        try {
+            $total = $resp.ContentLength
+            $in  = $resp.GetResponseStream()
+            $out = [IO.File]::Create($file)
+            try {
+                $buf = New-Object byte[] 262144
+                $done = 0L; $lastSend = [DateTime]::MinValue
+                while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
+                    $out.Write($buf, 0, $n)
+                    $done += $n
+                    if (((Get-Date) - $lastSend).TotalMilliseconds -gt 300) {
+                        $lastSend = Get-Date
+                        $mb = '{0:N1}' -f ($done / 1MB)
+                        if ($total -gt 0) {
+                            Send @{ Type = 'progress'; Value = $done; Max = $total; Text = ('{0}: {1} из {2:N1} МБ' -f $title, $mb, ($total / 1MB)) }
+                        } else {
+                            Send @{ Type = 'progress'; Value = 0; Max = 1; Text = "${title}: $mb МБ" }
+                        }
+                    }
+                }
+            } finally { $out.Dispose(); $in.Dispose() }
+        } finally { $resp.Close() }
+        Log ('    Загружено: {0} ({1:N1} МБ)' -f [IO.Path]::GetFileName($file), ((Get-Item -LiteralPath $file).Length / 1MB))
+    }
+
+    $result = $null
+    try {
+        Log 'winget не найден. Начинаю автоматическую установку.'
+
+        $build = [Environment]::OSVersion.Version.Build
+        if ($build -lt 17763) { throw "winget работает только на Windows 10 1809 (сборка 17763) и новее, у вас сборка $build." }
+        if (-not (Get-Command Add-AppxPackage -ErrorAction SilentlyContinue)) {
+            throw 'В системе нет модуля Appx (Add-AppxPackage): установка пакетов MSIX вырезана из сборки.'
+        }
+
+        # 1. Пакет уже есть, но не зарегистрирован для пользователя
+        Step 'winget: пробую зарегистрировать «Установщик приложений»...'
+        try {
+            Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
+        } catch { Log '    Пакет в системе не найден.' }
+        $result = Test-Winget
+
+        # 2. Загрузка App Installer и зависимостей (VCLibs, UI.Xaml) с GitHub
+        if (-not $result) {
+            try {
+                [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                $arch = switch ($env:PROCESSOR_ARCHITECTURE) { 'ARM64' { 'arm64' } 'x86' { 'x86' } default { 'x64' } }
+                if ($env:PROCESSOR_ARCHITEW6432 -eq 'AMD64') { $arch = 'x64' }
+                $dir = Join-Path $env:TEMP 'BatchInstaller\winget'
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+                New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+                Step 'winget: ищу последнюю версию на GitHub...'
+                $base = 'https://github.com/microsoft/winget-cli/releases/latest/download'
+                $bundleUrl = "$base/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
+                $depsUrl   = "$base/DesktopAppInstaller_Dependencies.zip"
+                $licUrl    = $null
+                try {
+                    $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/winget-cli/releases/latest' -UserAgent 'BatchInstaller' -UseBasicParsing
+                    Log "    Версия: $($rel.tag_name)"
+                    foreach ($a in $rel.assets) {
+                        if ($a.name -like '*.msixbundle')                   { $bundleUrl = $a.browser_download_url }
+                        elseif ($a.name -eq 'DesktopAppInstaller_Dependencies.zip') { $depsUrl = $a.browser_download_url }
+                        elseif ($a.name -like '*License*.xml')              { $licUrl = $a.browser_download_url }
+                    }
+                } catch { Log "    GitHub API недоступен ($($_.Exception.Message)), использую прямые ссылки." }
+
+                $bundle = Join-Path $dir 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle'
+                $depsZip = Join-Path $dir 'Dependencies.zip'
+                Get-File $depsUrl $depsZip 'winget: загрузка зависимостей'
+                Get-File $bundleUrl $bundle 'winget: загрузка App Installer'
+                $lic = $null
+                if ($licUrl) {
+                    $lic = Join-Path $dir 'License.xml'
+                    try { Get-File $licUrl $lic 'winget: загрузка лицензии' } catch { $lic = $null }
+                }
+
+                Step 'winget: распаковка зависимостей...'
+                $depsDir = Join-Path $dir 'deps'
+                Expand-Archive -LiteralPath $depsZip -DestinationPath $depsDir -Force
+                $deps = @(Get-ChildItem -Path $depsDir -Recurse -File |
+                          Where-Object { $_.Extension -match '^\.(appx|msix)$' -and $_.FullName -match "[\\_]$arch[\\_.]" } | ForEach-Object { $_.FullName })
+                foreach ($d in $deps) { Log "    Зависимость: $([IO.Path]::GetFileName($d))" }
+
+                # Зависимости ставим по одной: уже установленные более новые версии не мешают
+                Step 'winget: установка зависимостей (VCLibs, UI.Xaml)...'
+                foreach ($d in $deps) {
+                    try { Add-AppxPackage -Path $d -ErrorAction Stop }
+                    catch { Log "    $([IO.Path]::GetFileName($d)): $($_.Exception.Message.Trim())" }
+                }
+
+                Step 'winget: установка «Установщика приложений»...'
+                $provisioned = $false
+                try {
+                    # Для всех пользователей (нужны права администратора, они у нас есть)
+                    $pp = @{ Online = $true; PackagePath = $bundle; ErrorAction = 'Stop' }
+                    if ($deps.Count) { $pp.DependencyPackagePath = $deps }
+                    if ($lic) { $pp.LicensePath = $lic } else { $pp.SkipLicense = $true }
+                    Add-AppxProvisionedPackage @pp | Out-Null
+                    $provisioned = $true
+                    Log '    Пакет подготовлен для всех пользователей.'
+                } catch { Log "    Add-AppxProvisionedPackage: $($_.Exception.Message.Trim())" }
+
+                try {
+                    $ap = @{ Path = $bundle; ForceApplicationShutdown = $true; ErrorAction = 'Stop' }
+                    if ($deps.Count) { $ap.DependencyPath = $deps }
+                    Add-AppxPackage @ap
+                } catch {
+                    if ($provisioned) {
+                        try { Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop }
+                        catch { Log "    Регистрация: $($_.Exception.Message.Trim())" }
+                    } else { Log "    Add-AppxPackage: $($_.Exception.Message.Trim())" }
+                }
+                Start-Sleep -Seconds 2
+                $result = Test-Winget
+                if (-not $result) { Log '    После установки с GitHub winget не отвечает.' }
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            } catch { Log "    Установка с GitHub не удалась: $($_.Exception.Message)" }
+        }
+
+        # 3. Запасной способ: официальный модуль Microsoft.WinGet.Client из PowerShell Gallery
+        if (-not $result) {
+            try {
+                Step 'winget: запасной способ, модуль Microsoft.WinGet.Client...'
+                [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue | Where-Object { $_.Version -ge [version]'2.8.5.201' })) {
+                    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ForceBootstrap -Scope AllUsers | Out-Null
+                }
+                Install-Module -Name Microsoft.WinGet.Client -Force -AllowClobber -Scope AllUsers -Repository PSGallery -ErrorAction Stop
+                Import-Module Microsoft.WinGet.Client -Force
+                Step 'winget: Repair-WinGetPackageManager (загрузка и установка)...'
+                Repair-WinGetPackageManager -AllUsers -Latest -Force | Out-Null
+                Start-Sleep -Seconds 2
+                $result = Test-Winget
+            } catch { Log "    Модуль Microsoft.WinGet.Client: $($_.Exception.Message)" }
+        }
+    } catch {
+        Log "    $($_.Exception.Message)"
+    }
+
+    if ($result) {
+        $ver = try { & $result --version 2>$null | Select-Object -First 1 } catch { '' }
+        Log "winget установлен: $ver ($result)"
+    } else {
+        Log 'Не удалось установить winget автоматически. Программы с источником winget будут пропущены, url и local установятся как обычно.'
+        Log 'Установите App Installer вручную с https://aka.ms/getwinget и перезапустите программу (или нажмите на надпись про winget внизу, чтобы повторить).'
+    }
+    Send @{ Type = 'winget'; Path = $result }
+}
+
 # ---------------------------------------------------------------------------
 # Вспомогательные функции UI
 # ---------------------------------------------------------------------------
@@ -984,6 +1172,14 @@ function Invoke-Message($m) {
             if ($m.Reboot) { $msg += "`n`nДля завершения установки некоторых программ нужна перезагрузка." }
             $icon = $(if ($m.Fail -gt 0) { 'Warning' } else { 'Information' })
             [System.Windows.MessageBox]::Show($Window, $msg, 'Установка завершена', 'OK', $icon) | Out-Null
+        }
+        'winget' {
+            Set-Busy $false
+            Clear-Workers
+            $script:Winget = $m.Path
+            Update-WingetInfo
+            $ui.Progress.Value = 0
+            $ui.ProgressText.Text = $(if ($m.Path) { 'Готово к установке' } else { 'winget не установлен: доступны только программы из url и local' })
         }
         'installed' {
             Set-Busy $false
@@ -1115,14 +1311,38 @@ $Window.Add_Closing({
 # ---------------------------------------------------------------------------
 # Запуск
 # ---------------------------------------------------------------------------
-if ($Winget) {
-    $ver = try { (& $Winget --version 2>$null | Select-Object -First 1) } catch { '' }
-    $ui.WingetInfo.Text = "winget $ver"
-} else {
-    $ui.WingetInfo.Text = 'winget не найден: программы из winget установить не получится'
-    $ui.WingetInfo.Foreground = '#C62828'
-    Write-UiLog 'winget не найден. Установите «Установщик приложений» (App Installer) из Microsoft Store или с https://aka.ms/getwinget, затем перезапустите программу.'
+function Update-WingetInfo {
+    if ($script:Winget) {
+        $ver = try { (& $script:Winget --version 2>$null | Select-Object -First 1) } catch { '' }
+        $ui.WingetInfo.Text = "winget $ver"
+        $ui.WingetInfo.Foreground = $Window.FindResource('Muted')
+        $ui.WingetInfo.Cursor = $null
+        $ui.WingetInfo.ToolTip = $null
+    } else {
+        $ui.WingetInfo.Text = 'winget не найден: нажмите, чтобы установить'
+        $ui.WingetInfo.Foreground = '#C62828'
+        $ui.WingetInfo.Cursor = [System.Windows.Input.Cursors]::Hand
+        $ui.WingetInfo.ToolTip = 'Скачать и установить winget (App Installer) с GitHub'
+    }
 }
+
+# Автоматическая установка winget в фоне, окно при этом остаётся отзывчивым
+function Start-WingetSetup {
+    if ($script:Busy -or $script:Winget) { return }
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    $logFile = Join-Path $LogDir ('winget-setup-{0:yyyy-MM-dd_HH-mm-ss}.log' -f (Get-Date))
+    Set-Busy $true
+    $ui.BtnCancel.IsEnabled = $false
+    $ui.WingetInfo.Text = 'winget: идёт установка...'
+    $ui.WingetInfo.Cursor = $null
+    Write-UiLog "Лог установки winget: $logFile"
+    Start-Worker $WingetSetupWorker @($Sync, $logFile)
+}
+
+$ui.WingetInfo.Add_MouseLeftButtonUp({ if (-not $script:Winget) { Start-WingetSetup } })
+
+Update-WingetInfo
+if (-not $Winget) { $Window.Add_ContentRendered({ Start-WingetSetup }) }
 $ru = [Globalization.CultureInfo]::GetCultureInfo('ru-RU')
 $now = Get-Date
 $day = $now.ToString('ddd', $ru)
