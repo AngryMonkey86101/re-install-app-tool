@@ -105,6 +105,8 @@ function Find-Winget {
     if ($cmd) { $cands += $cmd.Source }
     $cands += @(Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
                 Sort-Object LastWriteTime -Descending | ForEach-Object { $_.FullName })
+    $portable = Join-Path $env:ProgramData 'BatchInstaller\winget\winget.exe'
+    if (Test-Path -LiteralPath $portable) { $cands += $portable }
     foreach ($c in $cands) {
         try {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -969,6 +971,8 @@ $WingetSetupWorker = {
         }
         Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | ForEach-Object { if (-not $list.Contains($_.FullName)) { $list.Add($_.FullName) } }
+        $portable = Join-Path $env:ProgramData 'BatchInstaller\winget\winget.exe'
+        if ([IO.File]::Exists($portable)) { $list.Add($portable) }
         return $list
     }
 
@@ -1021,6 +1025,77 @@ $WingetSetupWorker = {
             if ($r.Ok) { return $c }
             if ($Verbose) { Log "    $c : $($r.Info)" }
         }
+        return $null
+    }
+
+    # Службы, без которых приложения из пакетов MSIX не запускаются.
+    # В урезанных сборках их часто отключают: тогда winget установлен, но при запуске
+    # «Доступ к этому файлу из системы отсутствует» и «No applicable license found».
+    function Repair-AppServices {
+        $services = [ordered]@{
+            ClipSVC        = 'Служба лицензий клиента (ClipSVC)'
+            LicenseManager = 'Служба Windows License Manager'
+            AppXSvc        = 'Служба развёртывания AppX (AppXSVC)'
+            StateRepository = 'Служба State Repository'
+        }
+        foreach ($name in $services.Keys) {
+            $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$name"
+            if (-not (Test-Path -LiteralPath $key)) { Log "    $($services[$name]): служба удалена из системы, починить нельзя."; continue }
+            $start = (Get-ItemProperty -LiteralPath $key -Name Start -ErrorAction SilentlyContinue).Start
+            if ($start -eq 4) {
+                try {
+                    # Set-Service для защищённых служб не работает, поэтому через реестр (3 = вручную, как в обычной Windows)
+                    Set-ItemProperty -LiteralPath $key -Name Start -Value 3 -Type DWord -ErrorAction Stop
+                    Log "    $($services[$name]) была отключена, включил (запуск вручную)."
+                } catch { Log "    $($services[$name]) отключена, включить не удалось: $($_.Exception.Message)" }
+            }
+            if ($name -in 'ClipSVC', 'LicenseManager') {
+                try {
+                    $svc = Get-Service -Name $name -ErrorAction Stop
+                    if ($svc.Status -ne 'Running') { Start-Service -Name $name -ErrorAction Stop; Log "    $($services[$name]): запущена." }
+                } catch { Log "    $($services[$name]): не запускается ($($_.Exception.Message))" }
+            }
+        }
+        # Политики, которые запрещают запуск приложений из Магазина (их не меняю, только сообщаю)
+        $pol = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' -ErrorAction SilentlyContinue
+        if ($pol -and $pol.DisableStoreApps -eq 1) {
+            Log '    Внимание: включена политика DisableStoreApps (HKLM\SOFTWARE\Policies\Microsoft\WindowsStore). Она запрещает запуск приложений из Магазина, в том числе winget.'
+        }
+    }
+
+    # Портативный winget: распаковать пакет в папку и запускать winget.exe оттуда,
+    # без регистрации и лицензии. Используется, когда установленный пакет не стартует.
+    function Install-PortableWinget([string]$bundle, [string[]]$deps, [string]$arch) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $target = Join-Path $env:ProgramData 'BatchInstaller\winget'
+        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $target | Out-Null
+        $tmpMsix = Join-Path $env:TEMP ('AppInstaller_{0}.msix' -f [guid]::NewGuid())
+        $zip = [IO.Compression.ZipFile]::OpenRead($bundle)
+        try {
+            $entry = $zip.Entries | Where-Object { $_.Name -match "_$arch\.msix$" } | Select-Object -First 1
+            if (-not $entry) { throw "в пакете нет AppInstaller для $arch" }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $tmpMsix, $true)
+        } finally { $zip.Dispose() }
+        try { [IO.Compression.ZipFile]::ExtractToDirectory($tmpMsix, $target) }
+        finally { Remove-Item -LiteralPath $tmpMsix -ErrorAction SilentlyContinue }
+        # Библиотеки зависимостей (VCLibs, WindowsAppRuntime) кладём рядом с winget.exe
+        foreach ($d in $deps) {
+            $z = [IO.Compression.ZipFile]::OpenRead($d)
+            try {
+                foreach ($e in $z.Entries) {
+                    if ($e.FullName -notmatch '[/\\]' -and $e.Name -match '\.dll$') {
+                        $out = Join-Path $target $e.Name
+                        if (-not (Test-Path -LiteralPath $out)) { [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $out) }
+                    }
+                }
+            } finally { $z.Dispose() }
+        }
+        $exe = Join-Path $target 'winget.exe'
+        if (-not (Test-Path -LiteralPath $exe)) { throw 'после распаковки winget.exe не найден' }
+        $r = Invoke-Probe $exe
+        if ($r.Ok) { return $exe }
+        Log "    Портативный winget: $($r.Info)"
         return $null
     }
 
@@ -1096,6 +1171,9 @@ $WingetSetupWorker = {
         if (-not (Get-Command Add-AppxPackage -ErrorAction SilentlyContinue)) {
             throw 'В системе нет модуля Appx (Add-AppxPackage): установка пакетов MSIX вырезана из сборки.'
         }
+
+        Step 'winget: проверяю службы лицензий и AppX...'
+        Repair-AppServices
 
         # 1. Пакет уже есть, но не зарегистрирован для пользователя
         Step 'winget: пробую зарегистрировать «Установщик приложений»...'
@@ -1181,8 +1259,17 @@ $WingetSetupWorker = {
                 }
                 $result = Wait-Winget
                 if (-not $result) { Log '    После установки с GitHub winget не отвечает (причины выше).' }
-                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+
+                # 2б. Портативный winget из того же пакета
+                if (-not $result) {
+                    Step 'winget: пробую портативный вариант (без регистрации пакета)...'
+                    try {
+                        $result = Install-PortableWinget $bundle $deps $arch
+                        if ($result) { Log "    Портативный winget работает: $result" }
+                    } catch { Log "    Портативный winget: $($_.Exception.Message)" }
+                }
             } catch { Log "    Установка с GitHub не удалась: $($_.Exception.Message)" }
+            finally { if ($dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue } }
         }
 
         # 3. Запасной способ: официальный модуль Microsoft.WinGet.Client из PowerShell Gallery
