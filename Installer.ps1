@@ -97,12 +97,26 @@ namespace BatchInstaller {
 # ---------------------------------------------------------------------------
 # Поиск winget
 # ---------------------------------------------------------------------------
+# Возвращает путь к winget, только если он реально запускается.
+# Если файл есть, но не отвечает, вернётся $null и запустится починка/установка.
 function Find-Winget {
-    $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    $exe = Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
-           Sort-Object LastWriteTime | Select-Object -Last 1
-    if ($exe) { return $exe.FullName }
+    $cands = @()
+    $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { $cands += $cmd.Source }
+    $cands += @(Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | ForEach-Object { $_.FullName })
+    foreach ($c in $cands) {
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $c; $psi.Arguments = '--version'
+            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $out = $p.StandardOutput.ReadToEndAsync()
+            if ($p.WaitForExit(15000) -and $p.ExitCode -eq 0 -and $out.Result -match '\d+\.\d+') { return $c }
+            if (-not $p.HasExited) { try { $p.Kill() } catch { } }
+        } catch { }
+    }
     return $null
 }
 
@@ -940,26 +954,106 @@ $WingetSetupWorker = {
     }
     function Step([string]$t) { Send @{ Type = 'progress'; Value = 0; Max = 1; Text = $t }; Log $t }
 
-    function Find-Winget {
-        $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
-        if ($cmd) { return $cmd.Source }
-        $user = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
-        if (Test-Path -LiteralPath $user) { return $user }
-        $exe = Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
-               Sort-Object LastWriteTime | Select-Object -Last 1
-        if ($exe) { return $exe.FullName }
+    # Все места, где может лежать winget.exe: псевдоним приложения и сам пакет
+    function Get-WingetCandidates {
+        $list = New-Object System.Collections.Generic.List[string]
+        $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+        if ([IO.File]::Exists($alias)) { $list.Add($alias) }
+        $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd -and -not $list.Contains($cmd.Source)) { $list.Add($cmd.Source) }
+        $pkgs = @(Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue) +
+                @(Get-AppxPackage -AllUsers -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue)
+        foreach ($p in ($pkgs | Where-Object { $_ } | Sort-Object { [version]$_.Version } -Descending)) {
+            $exe = Join-Path $p.InstallLocation 'winget.exe'
+            if ([IO.File]::Exists($exe) -and -not $list.Contains($exe)) { $list.Add($exe) }
+        }
+        Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | ForEach-Object { if (-not $list.Contains($_.FullName)) { $list.Add($_.FullName) } }
+        return $list
+    }
+
+    # Запуск winget --version с таймаутом, без исключений на stderr
+    function Invoke-Probe([string]$exe) {
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $exe
+            $psi.Arguments = '--version'
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $outTask = $p.StandardOutput.ReadToEndAsync()
+            $errTask = $p.StandardError.ReadToEndAsync()
+            if (-not $p.WaitForExit(30000)) { try { $p.Kill() } catch { }; return @{ Ok = $false; Info = 'нет ответа за 30 с' } }
+            $out = ($outTask.Result + ' ' + $errTask.Result).Trim()
+            if ($p.ExitCode -eq 0 -and $out -match 'v?\d+\.\d+') { return @{ Ok = $true; Info = $out } }
+            return @{ Ok = $false; Info = ('код 0x{0:X8} {1}' -f $p.ExitCode, $out).Trim() }
+        } catch { return @{ Ok = $false; Info = $_.Exception.Message } }
+    }
+
+    # Обновить PATH процесса из реестра (после установки пакета он устаревший)
+    function Update-ProcessPath {
+        $parts = @([Environment]::GetEnvironmentVariable('Path', 'Machine'), [Environment]::GetEnvironmentVariable('Path', 'User'),
+                   (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'))
+        $env:Path = (($parts -join ';') -split ';' | Where-Object { $_ } | Select-Object -Unique) -join ';'
+    }
+
+    # Добавить в PATH папки зависимостей (VCLibs, UI.Xaml, WindowsAppRuntime):
+    # без них winget.exe, запущенный напрямую из WindowsApps, не стартует
+    function Add-DependencyPath {
+        $arch = switch ($env:PROCESSOR_ARCHITECTURE) { 'ARM64' { 'Arm64' } 'x86' { 'X86' } default { 'X64' } }
+        if ($env:PROCESSOR_ARCHITEW6432 -eq 'AMD64') { $arch = 'X64' }
+        $names = 'Microsoft.VCLibs.140.00.UWPDesktop', 'Microsoft.VCLibs.140.00', 'Microsoft.UI.Xaml.*', 'Microsoft.WindowsAppRuntime.*'
+        $dirs = foreach ($n in $names) {
+            @(Get-AppxPackage -AllUsers -Name $n -ErrorAction SilentlyContinue) |
+                Where-Object { [string]$_.Architecture -eq $arch -and $_.InstallLocation } |
+                Sort-Object { [version]$_.Version } -Descending | Select-Object -First 1 | ForEach-Object { $_.InstallLocation }
+        }
+        $add = @($dirs | Where-Object { $_ -and ($env:Path -split ';') -notcontains $_ })
+        if ($add.Count) { $env:Path = (($add + $env:Path) -join ';') }
+    }
+
+    # Найти работающий winget; $Verbose = писать в лог, почему каждый вариант не подошёл
+    function Test-Winget([bool]$Verbose = $false) {
+        foreach ($c in (Get-WingetCandidates)) {
+            $r = Invoke-Probe $c
+            if ($r.Ok) { return $c }
+            if ($Verbose) { Log "    $c : $($r.Info)" }
+        }
         return $null
     }
 
-    # winget найден и отвечает на --version
-    function Test-Winget {
-        $w = Find-Winget
-        if (-not $w) { return $null }
-        try {
-            $v = & $w --version 2>$null | Select-Object -First 1
-            if ($LASTEXITCODE -eq 0 -and $v) { return $w }
-        } catch { }
-        return $null
+    # После установки пакета: зарегистрировать, дождаться псевдонима winget и проверить
+    function Wait-Winget([int]$Seconds = 45) {
+        try { Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop } catch { }
+        $deadline = (Get-Date).AddSeconds($Seconds)
+        do {
+            Update-ProcessPath
+            $w = Test-Winget
+            if ($w) { return $w }
+            Send @{ Type = 'progress'; Value = 0; Max = 1; Text = 'winget: жду, пока Windows зарегистрирует команду winget...' }
+            Start-Sleep -Seconds 3
+        } while ((Get-Date) -lt $deadline)
+
+        # Повторная регистрация из манифеста установленного пакета
+        $pkg = @(Get-AppxPackage -AllUsers -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue) |
+               Sort-Object { [version]$_.Version } -Descending | Select-Object -First 1
+        if ($pkg) {
+            Log "    Пакет: $($pkg.PackageFullName), статус: $($pkg.Status)"
+            try {
+                Add-AppxPackage -Register (Join-Path $pkg.InstallLocation 'AppxManifest.xml') -DisableDevelopmentMode -ForceApplicationShutdown -ErrorAction Stop
+                Start-Sleep -Seconds 3
+                $w = Test-Winget
+                if ($w) { return $w }
+            } catch { Log "    Перерегистрация: $($_.Exception.Message.Trim())" }
+        } else { Log '    Пакет Microsoft.DesktopAppInstaller в системе не найден.' }
+
+        # Запуск напрямую из папки пакета с зависимостями в PATH
+        Add-DependencyPath
+        $w = Test-Winget $true
+        if ($w) { Log '    winget запускается напрямую из папки пакета.' }
+        return $w
     }
 
     # Загрузка файла с отображением прогресса
@@ -1009,6 +1103,10 @@ $WingetSetupWorker = {
             Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
         } catch { Log '    Пакет в системе не найден.' }
         $result = Test-Winget
+        if (-not $result -and (Get-AppxPackage -AllUsers -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue)) {
+            Log '    Пакет есть, но winget не отвечает. Пробую починить регистрацию.'
+            $result = Wait-Winget 15
+        }
 
         # 2. Загрузка App Installer и зависимостей (VCLibs, UI.Xaml) с GitHub
         if (-not $result) {
@@ -1081,9 +1179,8 @@ $WingetSetupWorker = {
                         catch { Log "    Регистрация: $($_.Exception.Message.Trim())" }
                     } else { Log "    Add-AppxPackage: $($_.Exception.Message.Trim())" }
                 }
-                Start-Sleep -Seconds 2
-                $result = Test-Winget
-                if (-not $result) { Log '    После установки с GitHub winget не отвечает.' }
+                $result = Wait-Winget
+                if (-not $result) { Log '    После установки с GitHub winget не отвечает (причины выше).' }
                 Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
             } catch { Log "    Установка с GitHub не удалась: $($_.Exception.Message)" }
         }
@@ -1100,8 +1197,7 @@ $WingetSetupWorker = {
                 Import-Module Microsoft.WinGet.Client -Force
                 Step 'winget: Repair-WinGetPackageManager (загрузка и установка)...'
                 Repair-WinGetPackageManager -AllUsers -Latest -Force | Out-Null
-                Start-Sleep -Seconds 2
-                $result = Test-Winget
+                $result = Wait-Winget
             } catch { Log "    Модуль Microsoft.WinGet.Client: $($_.Exception.Message)" }
         }
     } catch {
