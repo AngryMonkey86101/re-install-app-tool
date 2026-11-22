@@ -890,6 +890,7 @@ $InstallWorker = {
             }
             $exe = $null
             if ($j.Exe) { $exe = [Environment]::ExpandEnvironmentVariables($j.Exe); if (-not (Test-Path -LiteralPath $exe)) { Log "    Не найден exe из apps.json: $exe"; $exe = $null } }
+            if (-not $exe) { foreach ($e in (Find-ArpEntry $j)) { $exe = Get-ArpExe $e; if ($exe) { break } } }
             if (-not $exe) { $exe = Find-AppExe $j.Name }
             if ($exe) {
                 if (Test-OnDesktop "$($j.Name).lnk") { return }
@@ -899,6 +900,70 @@ $InstallWorker = {
                 Log '    Ярлык не найден и exe программы не обнаружен. Можно указать путь к exe в apps.json (поле "exe").'
             }
         } catch { Log "    Не удалось создать ярлык: $($_.Exception.Message)" }
+    }
+
+    # --- Проверка, что программа действительно установилась (раздел «Программы и компоненты») ---
+    function Get-ArpEntries {
+        $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        foreach ($k in $keys) {
+            Get-ItemProperty -Path $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object {
+                [pscustomobject]@{ Key = [string]$_.PSPath; Name = [string]$_.DisplayName; Location = [string]$_.InstallLocation; Icon = [string]$_.DisplayIcon }
+            }
+        }
+    }
+    # Слова для поиска программы: из названия и из id winget (AmneziaVPN.AmneziaVPN -> AmneziaVPN)
+    function Get-AppWords($j) {
+        $w = @(($j.Name -split '[\s\-\.]+') | Where-Object { $_.Length -ge 3 } | Select-Object -First 1)
+        if ($j.Id) { $w += @(($j.Id -split '\.') | Select-Object -Last 1) }
+        return @($w | Where-Object { $_ } | Select-Object -Unique)
+    }
+    function Find-ArpEntry($j) {
+        $words = Get-AppWords $j
+        @(Get-ArpEntries | Where-Object { $n = $_.Name; @($words | Where-Object { $n -like "*$_*" }).Count -gt 0 })
+    }
+    # exe программы из записи в реестре (DisplayIcon или папка установки)
+    function Get-ArpExe($e) {
+        if ($e.Icon) {
+            $icon = ($e.Icon -replace ',\s*-?\d+$', '').Trim('"', ' ')
+            if ($icon -match '\.exe$' -and $icon -notmatch $junk -and (Test-Path -LiteralPath $icon)) { return $icon }
+        }
+        return $null
+    }
+    # Проверить установку и записать в журнал, где лежит программа. $true, если нашлась.
+    function Confirm-Installed($j) {
+        $found = Find-ArpEntry $j
+        if (-not $found.Count) { return $false }
+        foreach ($e in ($found | Select-Object -First 2)) {
+            $where = $(if ($e.Location) { $e.Location } elseif (Get-ArpExe $e) { Split-Path -Parent (Get-ArpExe $e) } else { 'папка не указана' })
+            Log "    В «Программах и компонентах»: $($e.Name). Папка: $where"
+            if ($e.Location -and -not (Test-Path -LiteralPath $e.Location)) { Log "    Внимание: папка $($e.Location) не существует." }
+        }
+        return $true
+    }
+    # Запасной путь: winget только скачивает установщик, а запускаем его мы
+    function Install-ViaDownload($j, [bool]$silent) {
+        $dir = Join-Path $env:TEMP ('BatchInstaller\wg-' + ($j.Id -replace '[^\w\.-]', '_'))
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Log '    Скачиваю установщик через winget download...'
+        $code = Invoke-Captured $winget (@('download', '--id', $j.Id, '--exact', '--source', $j.WingetSource, '-d', "`"$dir`"",
+                                         '--accept-package-agreements', '--accept-source-agreements') -join ' ')
+        $file = Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -match '^\.(exe|msi)$' } | Sort-Object Length -Descending | Select-Object -First 1
+        if (-not $file) { Log ('    Установщик не скачался (код 0x{0:X8}).' -f [int]$code); return $null }
+        # Тихие ключи берём из apps.json (silentArgs), иначе открываем обычный мастер установки
+        $argsLine = ''
+        if ($silent -and $j.SilentArgs) { $argsLine = $j.SilentArgs }
+        elseif ($silent -and $file.Extension -eq '.msi') { $argsLine = '/qn /norestart' }
+        elseif ($silent) { Log '    Тихие ключи неизвестны, открываю мастер установки: пройдите его вручную.' }
+        Send @{ Type = 'status'; Index = $j.Index; Status = 'Установка...' }
+        Log "    Запуск: $($file.FullName) $argsLine"
+        $rc = Invoke-Installer $file.FullName $argsLine
+        Log "    Установщик завершился с кодом $rc"
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        return (Confirm-Installed $j)
     }
 
     $ok = 0; $fail = 0; $skip = 0; $reboot = $false; $cancelled = $false
@@ -938,6 +1003,15 @@ $InstallWorker = {
                     '8A15010A' { $result = 'Установлено (нужна перезагрузка)'; $reboot = $true }
                     '8A150014' { $result = 'Не найдено в winget (проверьте id)' }
                     default    { $result = "Ошибка (код 0x$hex)" }
+                }
+                # winget может отчитаться об успехе, хотя установщик не запускался:
+                # проверяем запись в «Программах и компонентах», при её отсутствии ставим сами
+                if ($result.StartsWith('Установлено') -and $j.WingetSource -ne 'msstore' -and -not (Confirm-Installed $j)) {
+                    Log '    winget сообщил об успехе, но программа не появилась в «Программах и компонентах».'
+                    $ok2 = Install-ViaDownload $j $silent
+                    if ($ok2 -eq $true)      { $result = 'Установлено' }
+                    elseif ($null -eq $ok2)  { $result = 'Установлено (не подтверждено)'; Log '    Проверьте программу вручную.' }
+                    else                     { $result = 'Ошибка (установщик не установил программу)' }
                 }
             }
             elseif ($j.Source -eq 'url' -or $j.Source -eq 'local') {
